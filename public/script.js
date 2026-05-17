@@ -13,6 +13,18 @@ const emotionDiv = document.getElementById('emotion');
 
 const labels = ["angry", "happy", "neutral", "sad"];
 
+// ============ LIGHTWEIGHT BACKGROUND PROCESSING ============
+const procCanvas = document.createElement('canvas');
+const pctx = procCanvas.getContext('2d');
+const PROCESS_WIDTH = 200;
+const PREDICT_INTERVAL = 300; // Predict emotion every 0.5 seconds
+const DETECT_INTERVAL = 300; // Detect & draw bounding box every 300ms for real-time feel
+// ========================================================
+
+// Cache untuk menyimpan faces terakhir dan emotions
+let lastFaces = [];
+let faceEmotions = {}; // map face index to emotion
+
 // ==========================
 // OPENCV READY
 // ==========================
@@ -90,9 +102,13 @@ async function startCamera() {
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
 
+            // Setup processing canvas (smaller for speed)
+            procCanvas.width = PROCESS_WIDTH;
+            procCanvas.height = Math.round(PROCESS_WIDTH * video.videoHeight / video.videoWidth);
+
             startPredictionLoop();
 
-            console.log("Camera ON ✅");
+            console.log("Camera ON ✅ (Processing at " + procCanvas.width + "x" + procCanvas.height + ")");
         };
 
         isCameraOn = true;
@@ -106,93 +122,195 @@ async function startCamera() {
 // LOOP
 // ==========================
 function startPredictionLoop() {
+    // Loop 1: Detect faces & update bounding boxes frequently (real-time)
     setInterval(() => {
-        if (model && cvReady && faceClassifier && video.readyState === 4) {
-            predict();
+        if (cvReady && faceClassifier && video.readyState === 4) {
+            detectFaces();
         }
-    }, 500);
+    }, DETECT_INTERVAL);
+
+    // Loop 2: Predict emotions less frequently (only every 0.5 seconds)
+    setInterval(() => {
+        if (model && cvReady && faceClassifier && video.readyState === 4 && lastFaces.length > 0) {
+            predictEmotions();
+        }
+    }, PREDICT_INTERVAL);
 }
 
 // ==========================
-// PREDICT
+// DETECT FACES (real-time bounding box, frequent)
 // ==========================
-function predict() {
+function detectFaces() {
     try {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        let src = cv.imread(canvas);
+        pctx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+        let src = cv.imread(procCanvas);
         let gray = new cv.Mat();
-
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
         let faces = new cv.RectVector();
-        faceClassifier.detectMultiScale(gray, faces, 1.2, 2);
+        faceClassifier.detectMultiScale(gray, faces, 1.4, 3);
 
-        console.log("faces:", faces.size());
-
-        // 🔥 LOOP SEMUA WAJAH
+        // Store faces for emotion prediction
+        lastFaces = [];
         for (let i = 0; i < faces.size(); i++) {
-            let face = faces.get(i);
+            lastFaces.push(faces.get(i));
+        }
 
-            let p1 = new cv.Point(face.x, face.y);
-            let p2 = new cv.Point(face.x + face.width, face.y + face.height);
+        // Clear canvas overlay
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            // ==========================
-            // CROP WAJAH
-            // ==========================
+        // Draw bounding boxes with cached emotions
+        const scaleX = canvas.width / procCanvas.width;
+        const scaleY = canvas.height / procCanvas.height;
+
+        for (let i = 0; i < lastFaces.length; i++) {
+            let face = lastFaces[i];
+            const scaledX = face.x * scaleX;
+            const scaledY = face.y * scaleY;
+            const scaledW = face.width * scaleX;
+            const scaledH = face.height * scaleY;
+
+            // Get cached emotion (or default to "detecting")
+            const emotion = faceEmotions[i] || "detecting...";
+            const satisfaction = faceEmotions[i] ? mapToSatisfaction(emotion) : "";
+
+            // Draw bounding box
+            let color = '#00FF00';
+            if (emotion === "angry") color = '#FF0000';
+            if (emotion === "sad") color = '#FFFF00';
+            if (emotion === "happy") color = '#00FF00';
+
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(scaledX, scaledY, scaledW, scaledH);
+
+            // Draw emotion label
+            ctx.fillStyle = color;
+            ctx.font = 'bold 14px Arial';
+            ctx.fillText(emotion + (satisfaction ? ' | ' + satisfaction : ''), scaledX, scaledY - 5);
+        }
+
+        src.delete();
+        gray.delete();
+        faces.delete();
+
+    } catch (err) {
+        console.error("Detect error:", err);
+    }
+}
+
+// ==========================
+// PREDICT EMOTIONS (infrequent, only every 2 seconds)
+// ==========================
+function predictEmotions() {
+    try {
+        pctx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+        let src = cv.imread(procCanvas);
+
+        // Process each cached face
+        for (let i = 0; i < lastFaces.length; i++) {
+            let face = lastFaces[i];
+            if (!face) continue;
+
             let faceMat = src.roi(face);
-
             let tempCanvas = document.createElement('canvas');
             tempCanvas.width = face.width;
             tempCanvas.height = face.height;
-
             cv.imshow(tempCanvas, faceMat);
 
-            // ==========================
-            // PREDIKSI EMOSI
-            // ==========================
-            let tensor = tf.browser.fromPixels(tempCanvas)
-                .resizeNearestNeighbor([224, 224])
-                .toFloat()
-                .div(255.0)
-                .expandDims();
+            // Predict emotion
+            const dataArr = tf.tidy(() => {
+                const pixels = tf.browser.fromPixels(tempCanvas);
+                const resized = pixels.resizeNearestNeighbor([224, 224]);
+                const normalized = resized.toFloat().div(255.0).expandDims();
+                const pred = model.predict(normalized);
+                const soft = tf.softmax(pred);
+                return Array.from(soft.dataSync());
+            });
 
-            const prediction = model.predict(tensor);
-            const data = tf.softmax(prediction).dataSync();
-
-            const emotion = getLabel(Array.from(data));
-            const satisfaction = mapToSatisfaction(emotion);
-
-            // simpan ke buffer (buat 3 detik)
+            const emotion = getLabel(dataArr);
+            faceEmotions[i] = emotion;
             emotionBuffer.push(emotion);
-
-            // ==========================
-            // GAMBAR KOTAK + TEXT
-            // ==========================
-            let org = new cv.Point(face.x, face.y - 10);
-            let color = [0, 255, 0, 255]; // default
-
-            if (emotion === "angry") color = [255, 0, 0, 255];
-            if (emotion === "sad") color = [255, 255, 0, 255];
-            if (emotion === "happy") color = [0, 255, 0, 255];
-
-            cv.rectangle(src, p1, p2, color, 2);
-            let text = emotion + " | " + satisfaction;
-
-            cv.putText(
-                src,
-                text,
-                org,
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                [0, 255, 0, 255],
-                2
-            );
 
             faceMat.delete();
         }
 
-        cv.imshow(canvas, src);
+        src.delete();
+
+    } catch (err) {
+        console.error("Predict error:", err);
+    }
+}
+
+// ===== DEPRECATED: Old predict() function, no longer used =====
+/*
+// ==========================
+// PREDICT (silent background processing, lightweight overlay)
+// ==========================
+function predict() {
+    try {
+        // ONLY process on small canvas, completely silent
+        pctx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+
+        let src = cv.imread(procCanvas);
+        let gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+        let faces = new cv.RectVector();
+        faceClassifier.detectMultiScale(gray, faces, 1.4, 3);
+
+        // Clear canvas overlay (transparent)
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Process each face and draw lightweight overlay only
+        for (let i = 0; i < faces.size(); i++) {
+            let face = faces.get(i);
+            let faceMat = src.roi(face);
+
+            // Convert to canvas for TF
+            let tempCanvas = document.createElement('canvas');
+            tempCanvas.width = face.width;
+            tempCanvas.height = face.height;
+            cv.imshow(tempCanvas, faceMat);
+
+            // Predict emotion (with proper tensor cleanup)
+            const dataArr = tf.tidy(() => {
+                const pixels = tf.browser.fromPixels(tempCanvas);
+                const resized = pixels.resizeNearestNeighbor([224, 224]);
+                const normalized = resized.toFloat().div(255.0).expandDims();
+                const pred = model.predict(normalized);
+                const soft = tf.softmax(pred);
+                return Array.from(soft.dataSync());
+            });
+
+            const emotion = getLabel(dataArr);
+            const satisfaction = mapToSatisfaction(emotion);
+            emotionBuffer.push(emotion);
+
+            // Scale face coordinates to full canvas
+            const scaleX = canvas.width / procCanvas.width;
+            const scaleY = canvas.height / procCanvas.height;
+            const scaledX = face.x * scaleX;
+            const scaledY = face.y * scaleY;
+            const scaledW = face.width * scaleX;
+            const scaledH = face.height * scaleY;
+
+            // Draw LIGHTWEIGHT overlay only (no video copy, just box + text)
+            let color = '#00FF00';
+            if (emotion === "angry") color = '#FF0000';
+            if (emotion === "sad") color = '#FFFF00';
+            if (emotion === "happy") color = '#00FF00';
+
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(scaledX, scaledY, scaledW, scaledH);
+
+            ctx.fillStyle = color;
+            ctx.font = '16px Arial';
+            ctx.fillText(emotion + ' | ' + satisfaction, scaledX, scaledY - 5);
+
+            faceMat.delete();
+        }
 
         src.delete();
         gray.delete();
@@ -202,6 +320,7 @@ function predict() {
         console.error("Predict error:", err);
     }
 }
+*/
 
 // ==========================
 // LABEL
